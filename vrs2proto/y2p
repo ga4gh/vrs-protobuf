@@ -1,0 +1,367 @@
+#!/usr/bin/env python
+
+import sys
+import yaml
+import re
+import subprocess
+from collections import Counter
+from inflector.languages.english import English
+import logging
+
+logger = logging.getLogger(__name__)
+debug_handler = logging.FileHandler('debug.log', mode='w')
+debug_handler.setLevel(logging.DEBUG)
+formatter = logging.Formatter("%(asctime)s %(name)s %(levelname)-8s %(message)s")
+debug_handler.setFormatter(formatter)
+logger.addHandler(debug_handler)
+logger.setLevel(logging.DEBUG)
+
+INFLECTOR = English()
+
+
+def _get_git_tag():
+    res = subprocess.run("git describe --tags --exact-match".split(), capture_output=True)
+    if res.stderr.decode().startswith("fatal"):
+        # if no exact tag, then get branch
+        res = subprocess.run("git rev-parse --abbrev-ref HEAD".split(), capture_output=True)
+    tag = res.stdout.decode().strip()
+    return tag
+
+
+def _parse_release_as_version(rls):
+    m = re.match("^(\d+\.\d+)", rls)
+    if m:
+        return m.group(1).replace('.', '_')
+    return rls
+
+
+def snake_case(camel_case):
+    return re.sub(r'(?<![A-Z])(?<!^)(?=[A-Z])', '_', camel_case).lower()
+
+
+def indent(text, level):
+    return '   ' * level + text
+
+
+def simplify_reference(reference_string):
+    try:
+        return reference_string.split('/')[-1]
+    except TypeError:
+        return reference_string
+
+
+def list_one_of(one_of_list):
+    return [simplify_reference(ref) for ref in one_of_list]
+
+
+class ProtoDoc:
+
+    def __init__(self, definitions, version):
+        self.header = f"""syntax = "proto3";
+
+package org.ga4gh.vrs.v{version};
+
+option java_multiple_files = true;
+option java_package = "org.ga4gh.vrs.v{version}";
+"""
+        self.definitions = definitions
+        self.messages = dict()
+        self.dependencies = dict()
+        self.abstract_types = set()
+        self.simple_types = set()
+        self._monkey_patch()
+        self._map_dependencies()
+        self._build_messages()
+
+    def emit(self):
+        print(self.header)
+        for message_name in list(self.definitions):
+            m = self.messages[message_name]
+            if m.simple:
+                continue
+            m.emit()
+            print()
+
+    def _monkey_patch(self):
+        logger.warning('Monkey patching Number/IndefiniteRange/DefiniteRange.')
+        self.definitions['Number']['properties']['value']['type'] = 'integer'
+        self.definitions['DefiniteRange']['properties']['min']['type'] = 'integer'
+        self.definitions['DefiniteRange']['properties']['max']['type'] = 'integer'
+        self.definitions['IndefiniteRange']['properties']['value']['type'] = 'integer'
+        return
+
+    def _resolve_reference_and_store(self, reference, message):
+        r = simplify_reference(reference)
+        if r == message:
+            return
+        if self.definitions[r].get('type') == 'string':
+            if r not in self.dependencies[message]:
+                self.dependencies[message].append(r)
+        elif 'properties' not in self.definitions[r]:
+            self._register_dependency(self.definitions[r], message)
+        else:
+            if r not in self.dependencies[message]:
+                self.dependencies[message].append(r)
+
+    def _register_dependency(self, arg, message):
+        if '$ref' in arg:
+            self._resolve_reference_and_store(arg['$ref'], message)
+        for conditional in ['oneOf', 'anyOf', 'allOf']:
+            if conditional in arg:
+                for sub_arg in arg[conditional]:
+                    if '$ref' in sub_arg:
+                        self._resolve_reference_and_store(sub_arg['$ref'], message)
+        if arg.get('type') == 'array' and arg.get('items'):
+            self._register_dependency(arg['items'], message)
+
+    def _map_dependencies(self):
+        for message, message_attributes in self.definitions.items():
+            self.dependencies[message] = list()
+            self._register_dependency(message_attributes, message)
+            if 'properties' in message_attributes:
+                for _, property_attributes in message_attributes['properties'].items():
+                    self._register_dependency(property_attributes, message)
+            elif message_attributes.get('type') == 'string':
+                self.simple_types.add(message)
+            else:
+                self.abstract_types.add(message)
+
+    def _build_message(self, message):
+        logger.debug(f'Checking {message} dependencies...')
+        for dependency in self.dependencies[message]:
+            if dependency in self.messages:
+                logger.debug(f'{message}.{dependency} dependency met.')
+                continue
+            else:
+                logger.debug(f'{message}.{dependency} dependency not met, building.')
+                self._build_message(dependency)
+        self.messages[message] = ProtoMessage(message, self)
+
+    def _build_messages(self):
+        for message in self.definitions:
+            self._build_message(message)
+
+
+class ProtoMessage:
+
+    property_basic_types = {
+        'string': 'string',
+        'number': 'double',
+        'integer': 'uint64',
+        'boolean': 'bool'
+    }
+
+    def __init__(self, message_name, document, fields=None):
+        logger.info(f'Building {message_name}...')
+        self.message_name = message_name
+        self.document = document
+        if fields is None:
+            self.js_definition = document.definitions[message_name]
+        else:
+            self.js_definition = dict()
+        self.deprecated = self.js_definition.get('deprecated', False)
+        self.properties = self.js_definition.get('properties', dict())
+        t = self.js_definition.get('type', None)
+        self.simple = (t == 'string')
+        self.abstract = not (bool(t) or self.simple)
+        self.nested = list()
+        if fields is None:
+            self.fields = list()
+            self._build_fields()
+        else:
+            self.fields = fields
+        self._uniquify_fields()
+        self._assign_proto_field_values()
+        logger.info(f'{message_name} built.')
+
+    def emit(self, level=0):
+        print(indent(f'message {self.message_name} {{', level))
+        for message in self.nested:
+            message.emit(level + 1)
+        for field in self.fields:
+            field.emit(level + 1)
+        print(indent('}', level))
+
+    def __repr__(self):
+        return f'{self.message_name} <ProtoMessage>'
+
+    def _dereference(self, field_name, reference):
+        k = simplify_reference(reference)
+        m = self.document.messages.get(k)
+        if k == self.message_name:
+            field = ProtoField(field_name, self.message_name, deprecated=self.deprecated)
+        elif k in self.document.simple_types:
+            field = ProtoField(field_name, m.js_definition['type'], deprecated=m.deprecated)
+        elif k not in self.document.abstract_types:
+            field = ProtoField(field_name, m.message_name, deprecated=m.deprecated)
+        else:
+            raise ValueError
+        return field
+
+    def _dereference_and_rename(self, reference):
+        s = simplify_reference(reference)
+        field = self._dereference('temp', s)
+        if s in self.document.simple_types:
+            field.name = snake_case(s)
+        else:
+            field.name = snake_case(field.field_type)
+        return field
+
+    def _create_oneof_field(self, name, field_references):
+        logger.debug(f'Creating {self.message_name}.one_of {name}')
+        one_of_fields = list()
+        for one_of_obj in field_references:
+            s = simplify_reference(one_of_obj['$ref'])
+            if s in self.document.abstract_types:
+                for dep in self.document.dependencies[s]:
+                    field = self._dereference_and_rename(dep)
+                    one_of_fields.append(field)
+            else:
+                field = self._dereference_and_rename(s)
+                one_of_fields.append(field)
+        return ProtoField(name, 'oneof', nested=one_of_fields)
+
+    def _build_fields(self):
+        if self.abstract:
+            logger.debug(f'{self.message_name} is abstract, resolving to concrete.')
+            field = self._create_oneof_field(snake_case(self.message_name), self.js_definition['oneOf'])
+            self.fields.append(field)
+            return
+        for prop, prop_attributes in self.properties.items():
+            if prop == 'type':
+                continue
+            if '$ref' in prop_attributes:
+                field = self._dereference(prop, prop_attributes['$ref'])
+            elif prop_attributes.get('type') in self.property_basic_types:
+                proto_type = self.property_basic_types[prop_attributes['type']]
+                field = ProtoField(prop, proto_type)
+            elif 'oneOf' in prop_attributes:
+                field = self._create_oneof_field(prop, prop_attributes['oneOf'])
+            elif 'allOf' in prop_attributes:
+                assert [list(x.keys())[0] for x in prop_attributes['allOf']] == ['$ref', 'not']
+                k = simplify_reference(prop_attributes['allOf'][0]['$ref'])
+                group_dependencies = set(self.document.dependencies[k])
+                not_field_ref = {simplify_reference(prop_attributes['allOf'][1]['not']['$ref'])}
+                field_refs = group_dependencies - not_field_ref
+                if len(field_refs) == 0:
+                    raise SyntaxError(prop)
+                elif len(field_refs) == 1:
+                    field = self._dereference(prop, field_refs.pop())
+                else:
+                    ordered_field_refs = [{'$ref': x} for x in self.document.dependencies[k] if x in field_refs]
+                    field = self._create_oneof_field(prop, ordered_field_refs)
+            elif prop_attributes['type'] == 'array':
+                field_refs = prop_attributes['items']['oneOf']
+                field = self._create_oneof_field('value', field_refs)
+                submessage_type = INFLECTOR.titleize(INFLECTOR.singularize(prop))
+                message = ProtoMessage(
+                    submessage_type,
+                    self.document,
+                    fields=[field]
+                )
+                self.nested.append(message)
+                field = ProtoField(prop, submessage_type, repeated=True)
+            else:
+                continue
+            self.fields.append(field)
+
+    def _uniquify_fields(self):
+        observed = Counter()
+        for field in self.fields:
+            observed[(field.name, field.field_type)] += 1
+            if observed[(field.name, field.field_type)] > 1:
+                field.name = f'{field.name}{observed[(field.name, field.field_type)]}'
+            if field.field_type == 'oneof':
+                for subfield in field.nested:
+                    observed[(subfield.name, subfield.field_type)] += 1
+        for field in self.fields:
+            if field.field_type == 'oneof':
+                for subfield in field.nested:
+                    if observed[(subfield.name, subfield.field_type)] > 1:
+                        subfield.name = f'{field.name}_{subfield.name}'
+
+    def _assign_proto_field_values(self):
+        # TODO: Modify this method to retrieve and account for previous field assignments
+        low_fields_counter = 1
+        high_fields_counter = 100
+        for field in self.fields:
+            if field.field_type == 'oneof':
+                for subfield in field.nested:
+                    if subfield.deprecated:
+                        subfield.number = high_fields_counter
+                        high_fields_counter += 1
+                    else:
+                        subfield.number = low_fields_counter
+                        low_fields_counter += 1
+            else:
+                if field.deprecated:
+                    field.number = high_fields_counter
+                    high_fields_counter += 1
+                else:
+                    field.number = low_fields_counter
+                    low_fields_counter += 1
+
+
+class ProtoField:
+
+    def __init__(self, name, field_type, number=None, nested=None, deprecated=False, repeated=False):
+        self.name = name
+        self.field_type = field_type
+        self.number = number
+        self.nested = nested
+        self.deprecated = deprecated
+        self.repeated = repeated
+
+    def emit(self, level):
+        if self.nested:
+            print(indent(f'{self.field_type} {self.name} {{', level))
+            for field in self.nested:
+                field.emit(level + 1)
+            print(indent('}', level))
+            return
+        if self.deprecated:
+            emit_string = f'{self.field_type} {self.name} = {self.number} [deprecated=true];'
+        else:
+            emit_string = f'{self.field_type} {self.name} = {self.number};'
+        if self.repeated:
+            print(indent(f'repeated {emit_string}', level))
+        else:
+            print(indent(emit_string, level))
+
+    def __repr__(self):
+        return f'{self.name} <ProtoField>'
+
+    def __sub__(self, other):
+        assert self.nested is not None
+        kmap = dict()
+        s = set()
+        for x in self.nested:
+            k = (x.name, x.field_type)
+            s.add(k)
+            kmap[k] = x
+        if other.nested is None:
+            s2 = {(other.name, other.field_type)}
+        else:
+            s2 = set([(x.name, x.field_type) for x in other.nested])
+        r = s - s2
+        if len(r) == 0:
+            return None
+        elif len(r) == 1:
+            k = r.pop()
+            return kmap[k]
+        else:
+            new = list()
+            for x in self.nested:
+                if (x.name, x.field_type) in r:
+                    new.append(x)
+            return ProtoField(self.name, self.field_type, self.number, new, self.deprecated)
+
+
+def main(version):
+    yaml_dict = yaml.load(sys.stdin, Loader=yaml.SafeLoader)
+    doc = ProtoDoc(yaml_dict['definitions'], version)
+    doc.emit()
+
+
+if __name__ == '__main__':
+    main(version='1')

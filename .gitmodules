@@ -1,3 +1,3 @@
 [submodule "vrs"]
 	path = vrs
-	url = git@github.com:ga4gh/vrs.git
+	url = https://github.com/ga4gh/vrs.git
